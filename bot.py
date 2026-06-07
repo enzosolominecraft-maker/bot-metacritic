@@ -114,7 +114,15 @@ async def fetch_movie(session: aiohttp.ClientSession, query: str, year: int | No
     async with session.get(f"{TMDB_BASE}/movie/{movie_id}", params=params) as r:
         if r.status != 200:
             return None
-        return await r.json()
+        detail = await r.json()
+
+    async with session.get(f"{TMDB_BASE}/movie/{movie_id}/credits", params=params) as r:
+        credits = await r.json() if r.status == 200 else {}
+
+    crew = credits.get("crew", [])
+    detail["_directors"] = [p["name"] for p in crew if p.get("job") == "Director"]
+    detail["_writers"] = [p["name"] for p in crew if p.get("job") in ("Writer", "Screenplay", "Story")]
+    return detail
 
 
 def build_movie_embed(data: dict) -> discord.Embed:
@@ -146,8 +154,15 @@ def build_movie_embed(data: dict) -> discord.Embed:
     )
     embed.add_field(name="ℹ️ Note", value=note, inline=False)
 
+    directors = ", ".join(data.get("_directors", [])[:2])
+    writers = ", ".join(data.get("_writers", [])[:2])
+
     if genres:
         embed.add_field(name="Genres", value=genres, inline=True)
+    if directors:
+        embed.add_field(name="Réalisateur(s)", value=directors, inline=True)
+    if writers:
+        embed.add_field(name="Scénariste(s)", value=writers, inline=True)
     if homepage:
         embed.add_field(name="Site officiel", value=f"[Lien]({homepage})", inline=True)
     if imdb_id:
@@ -176,7 +191,14 @@ async def fetch_show(session: aiohttp.ClientSession, query: str, year: int | Non
     async with session.get(f"{TMDB_BASE}/tv/{show_id}", params=params) as r:
         if r.status != 200:
             return None
-        return await r.json()
+        detail = await r.json()
+
+    async with session.get(f"{TMDB_BASE}/tv/{show_id}/credits", params=params) as r:
+        credits = await r.json() if r.status == 200 else {}
+
+    crew = credits.get("crew", [])
+    detail["_writers"] = [p["name"] for p in crew if p.get("job") in ("Writer", "Screenplay", "Story")]
+    return detail
 
 
 def build_show_embed(data: dict) -> discord.Embed:
@@ -207,10 +229,17 @@ def build_show_embed(data: dict) -> discord.Embed:
     )
     embed.add_field(name="ℹ️ Note", value=note, inline=False)
 
+    creators = ", ".join(c["name"] for c in (data.get("created_by") or [])[:2])
+    writers = ", ".join(data.get("_writers", [])[:2])
+
     if genres:
         embed.add_field(name="Genres", value=genres, inline=True)
     embed.add_field(name="Saisons", value=str(seasons), inline=True)
     embed.add_field(name="Statut", value=status, inline=True)
+    if creators:
+        embed.add_field(name="Créateur(s)", value=creators, inline=True)
+    if writers:
+        embed.add_field(name="Scénariste(s)", value=writers, inline=True)
 
     embed.set_footer(text="Source : TMDB")
     return embed
