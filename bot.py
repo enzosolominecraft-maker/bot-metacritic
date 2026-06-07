@@ -1,4 +1,7 @@
 import os
+import asyncio
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import aiohttp
 import discord
 from discord import app_commands
@@ -38,8 +41,8 @@ def score_emoji(score: int | None) -> str:
 
 # --- RAWG (jeux) ---
 
-async def fetch_game(session: aiohttp.ClientSession, query: str) -> dict | None:
-    params = {"key": RAWG_API_KEY, "search": query, "page_size": 1}
+async def fetch_game(session: aiohttp.ClientSession, query: str, year: int | None = None) -> dict | None:
+    params = {"key": RAWG_API_KEY, "search": query, "page_size": 10}
     async with session.get(f"{RAWG_BASE}/games", params=params) as r:
         if r.status != 200:
             return None
@@ -47,7 +50,11 @@ async def fetch_game(session: aiohttp.ClientSession, query: str) -> dict | None:
         results = data.get("results", [])
         if not results:
             return None
-        game = results[0]
+        if year:
+            match = next((g for g in results if (g.get("released") or "").startswith(str(year))), None)
+            game = match or results[0]
+        else:
+            game = results[0]
 
     # Détail complet pour avoir metacritic + description
     async with session.get(f"{RAWG_BASE}/games/{game['id']}", params={"key": RAWG_API_KEY}) as r:
@@ -90,8 +97,10 @@ def build_game_embed(data: dict) -> discord.Embed:
 
 # --- TMDB (films) ---
 
-async def fetch_movie(session: aiohttp.ClientSession, query: str) -> dict | None:
+async def fetch_movie(session: aiohttp.ClientSession, query: str, year: int | None = None) -> dict | None:
     params = {"api_key": TMDB_API_KEY, "query": query, "language": "fr-FR"}
+    if year:
+        params["primary_release_year"] = year
     async with session.get(f"{TMDB_BASE}/search/movie", params=params) as r:
         if r.status != 200:
             return None
@@ -150,8 +159,10 @@ def build_movie_embed(data: dict) -> discord.Embed:
 
 # --- TMDB (séries) ---
 
-async def fetch_show(session: aiohttp.ClientSession, query: str) -> dict | None:
+async def fetch_show(session: aiohttp.ClientSession, query: str, year: int | None = None) -> dict | None:
     params = {"api_key": TMDB_API_KEY, "query": query, "language": "fr-FR"}
+    if year:
+        params["first_air_date_year"] = year
     async with session.get(f"{TMDB_BASE}/search/tv", params=params) as r:
         if r.status != 200:
             return None
@@ -226,32 +237,33 @@ MediaType = app_commands.Choice
 @app_commands.describe(
     type="Type de média",
     titre="Titre à rechercher",
+    annee="Année de sortie (optionnel, pour départager deux titres identiques)",
 )
 @app_commands.choices(type=[
     app_commands.Choice(name="🎮 Jeu vidéo", value="game"),
     app_commands.Choice(name="🎬 Film", value="movie"),
     app_commands.Choice(name="📺 Série", value="show"),
 ])
-async def score(interaction: discord.Interaction, type: app_commands.Choice[str], titre: str):
+async def score(interaction: discord.Interaction, type: app_commands.Choice[str], titre: str, annee: int = None):
     await interaction.response.defer()
 
     async with aiohttp.ClientSession() as session:
         if type.value == "game":
-            data = await fetch_game(session, titre)
+            data = await fetch_game(session, titre, annee)
             if not data:
                 await interaction.followup.send(f"❌ Aucun jeu trouvé pour **{titre}**.")
                 return
             embed = build_game_embed(data)
 
         elif type.value == "movie":
-            data = await fetch_movie(session, titre)
+            data = await fetch_movie(session, titre, annee)
             if not data:
                 await interaction.followup.send(f"❌ Aucun film trouvé pour **{titre}**.")
                 return
             embed = build_movie_embed(data)
 
         else:
-            data = await fetch_show(session, titre)
+            data = await fetch_show(session, titre, annee)
             if not data:
                 await interaction.followup.send(f"❌ Aucune série trouvée pour **{titre}**.")
                 return
@@ -266,4 +278,20 @@ async def on_ready():
     print("Slash commands synchronisées.")
 
 
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, *args):
+        pass  # silence les logs HTTP
+
+
+def run_health_server():
+    port = int(os.getenv("PORT", 8080))
+    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
+
+
+threading.Thread(target=run_health_server, daemon=True).start()
 client.run(DISCORD_TOKEN)
