@@ -301,6 +301,333 @@ async def score(interaction: discord.Interaction, type: app_commands.Choice[str]
     await interaction.followup.send(embed=embed)
 
 
+# --- TMDB (réalisateur) ---
+
+async def fetch_director(session: aiohttp.ClientSession, query: str) -> dict | None:
+    params = {"api_key": TMDB_API_KEY, "query": query, "language": "fr-FR"}
+    async with session.get(f"{TMDB_BASE}/search/person", params=params) as r:
+        if r.status != 200:
+            return None
+        data = await r.json()
+        results = data.get("results", [])
+        if not results:
+            return None
+        person_id = results[0]["id"]
+
+    params = {"api_key": TMDB_API_KEY, "language": "fr-FR"}
+    async with session.get(f"{TMDB_BASE}/person/{person_id}", params=params) as r:
+        if r.status != 200:
+            return None
+        detail = await r.json()
+
+    # Films en tant que réalisateur
+    async with session.get(f"{TMDB_BASE}/person/{person_id}/movie_credits", params=params) as r:
+        credits = await r.json() if r.status == 200 else {}
+
+    directed = [
+        m for m in credits.get("crew", [])
+        if m.get("job") == "Director" and m.get("release_date")
+    ]
+    directed.sort(key=lambda m: m.get("release_date", ""), reverse=True)
+    detail["_directed"] = directed
+    return detail
+
+
+def build_director_embed(data: dict) -> discord.Embed:
+    name = data.get("name", "Inconnu")
+    birthday = data.get("birthday") or "?"
+    deathday = data.get("deathday")
+    birthplace = data.get("place_of_birth") or "?"
+    biography = data.get("biography") or ""
+    photo = f"{TMDB_IMG_BASE}{data['profile_path']}" if data.get("profile_path") else ""
+    tmdb_url = f"https://www.themoviedb.org/person/{data.get('id')}"
+
+    # Âge ou années de vie
+    if deathday:
+        age_str = f"{birthday} – {deathday}"
+    elif birthday and birthday != "?":
+        from datetime import date
+        try:
+            birth_year = int(birthday[:4])
+            age = date.today().year - birth_year
+            age_str = f"{birthday} ({age} ans)"
+        except ValueError:
+            age_str = birthday
+    else:
+        age_str = birthday
+
+    embed = discord.Embed(
+        title=f"🎬 {name}",
+        color=discord.Color.blurple(),
+        url=tmdb_url,
+    )
+
+    if photo:
+        embed.set_thumbnail(url=photo)
+
+    embed.add_field(name="Naissance", value=age_str, inline=True)
+    embed.add_field(name="Lieu de naissance", value=birthplace, inline=True)
+
+    # Filmographie (5 films les plus récents)
+    directed = data.get("_directed", [])
+    if directed:
+        films = "\n".join(
+            f"• **{m['title']}** ({m.get('release_date', '')[:4]})"
+            for m in directed[:5]
+        )
+        total = len(directed)
+        embed.add_field(
+            name=f"Filmographie ({total} films)",
+            value=films,
+            inline=False,
+        )
+
+    # Biographie (tronquée à 300 caractères)
+    if biography:
+        short_bio = biography[:300] + "…" if len(biography) > 300 else biography
+        embed.add_field(name="Biographie", value=short_bio, inline=False)
+
+    embed.set_footer(text="Source : TMDB")
+    return embed
+
+
+@client.tree.command(name="realisateur", description="Affiche la fiche TMDB d'un réalisateur")
+@app_commands.describe(nom="Nom du réalisateur")
+async def realisateur(interaction: discord.Interaction, nom: str):
+    await interaction.response.defer()
+
+    async with aiohttp.ClientSession() as session:
+        data = await fetch_director(session, nom)
+        if not data:
+            await interaction.followup.send(f"❌ Aucun réalisateur trouvé pour **{nom}**.")
+            return
+        embed = build_director_embed(data)
+
+    await interaction.followup.send(embed=embed)
+
+
+# --- RAWG (créateur de jeux) ---
+
+async def fetch_game_creator(session: aiohttp.ClientSession, query: str) -> dict | None:
+    # Recherche du créateur
+    params = {"key": RAWG_API_KEY, "search": query, "page_size": 5}
+    async with session.get(f"{RAWG_BASE}/creators", params=params) as r:
+        if r.status != 200:
+            return None
+        data = await r.json()
+        results = data.get("results", [])
+        if not results:
+            return None
+        creator = results[0]
+        creator_id = creator["id"]
+
+    # Détail du créateur
+    async with session.get(f"{RAWG_BASE}/creators/{creator_id}", params={"key": RAWG_API_KEY}) as r:
+        if r.status != 200:
+            return None
+        detail = await r.json()
+
+    # Jeux du créateur (jusqu'à 40 pour avoir assez de données)
+    params = {"key": RAWG_API_KEY, "creators": creator_id, "page_size": 40}
+    async with session.get(f"{RAWG_BASE}/games", params=params) as r:
+        if r.status != 200:
+            return detail
+        games_data = await r.json()
+        games = games_data.get("results", [])
+
+    # Top 10 par note Metacritic
+    with_score = [g for g in games if g.get("metacritic")]
+    top_rated = sorted(with_score, key=lambda g: g["metacritic"], reverse=True)[:10]
+
+    # 10 plus récents (par date de sortie)
+    with_date = [g for g in games if g.get("released")]
+    most_recent = sorted(with_date, key=lambda g: g["released"], reverse=True)[:10]
+
+    detail["_top_rated"] = top_rated
+    detail["_most_recent"] = most_recent
+    return detail
+
+
+def build_game_creator_embed(data: dict) -> discord.Embed:
+    name = data.get("name", "Inconnu")
+    image = data.get("image") or data.get("image_background") or ""
+    games_count = data.get("games_count", 0)
+    description = data.get("description") or ""
+    positions = ", ".join(p["name"] for p in (data.get("positions") or [])[:3])
+    tmdb_url = f"https://rawg.io/creators/{data.get('slug', '')}"
+
+    embed = discord.Embed(
+        title=f"🕹️ {name}",
+        color=discord.Color.og_blurple(),
+        url=tmdb_url,
+    )
+
+    if image:
+        embed.set_thumbnail(url=image)
+
+    if positions:
+        embed.add_field(name="Rôle(s)", value=positions, inline=True)
+    embed.add_field(name="Jeux au total", value=str(games_count), inline=True)
+
+    # Top 10 jeux les mieux notés
+    top_rated = data.get("_top_rated", [])
+    if top_rated:
+        lines = "\n".join(
+            f"`{g['metacritic']:>3}/100` • **{g['name']}** ({(g.get('released') or '')[:4]})"
+            for g in top_rated
+        )
+        embed.add_field(name="🏆 Top 10 mieux notés (Metacritic)", value=lines, inline=False)
+
+    # 10 jeux les plus récents
+    most_recent = data.get("_most_recent", [])
+    if most_recent:
+        lines = "\n".join(
+            f"• **{g['name']}** ({(g.get('released') or '')[:4]})"
+            + (f" — `{g['metacritic']}/100`" if g.get("metacritic") else "")
+            for g in most_recent
+        )
+        embed.add_field(name="🕐 10 jeux les plus récents", value=lines, inline=False)
+
+    # Biographie courte
+    if description:
+        import re
+        clean = re.sub(r"<[^>]+>", "", description)  # retire le HTML
+        short = clean[:300] + "…" if len(clean) > 300 else clean
+        embed.add_field(name="Biographie", value=short, inline=False)
+
+    embed.set_footer(text="Source : RAWG.io")
+    return embed
+
+
+@client.tree.command(name="createur", description="Affiche la fiche d'un créateur de jeux vidéo")
+@app_commands.describe(nom="Nom du créateur (ex: Shigeru Miyamoto, Hideo Kojima)")
+async def createur(interaction: discord.Interaction, nom: str):
+    await interaction.response.defer()
+
+    async with aiohttp.ClientSession() as session:
+        data = await fetch_game_creator(session, nom)
+        if not data:
+            await interaction.followup.send(f"❌ Aucun créateur trouvé pour **{nom}**.")
+            return
+        embed = build_game_creator_embed(data)
+
+    await interaction.followup.send(embed=embed)
+
+
+# --- RAWG (studio de jeux) ---
+
+async def fetch_studio(session: aiohttp.ClientSession, query: str) -> dict | None:
+    # Recherche du studio
+    params = {"key": RAWG_API_KEY, "search": query, "page_size": 5}
+    async with session.get(f"{RAWG_BASE}/developers", params=params) as r:
+        if r.status != 200:
+            return None
+        data = await r.json()
+        results = data.get("results", [])
+        if not results:
+            return None
+        studio_id = results[0]["id"]
+
+    # Détail du studio
+    async with session.get(f"{RAWG_BASE}/developers/{studio_id}", params={"key": RAWG_API_KEY}) as r:
+        if r.status != 200:
+            return None
+        detail = await r.json()
+
+    # Jeux du studio (jusqu'à 40 pour avoir assez de données)
+    params = {"key": RAWG_API_KEY, "developers": studio_id, "page_size": 40}
+    async with session.get(f"{RAWG_BASE}/games", params=params) as r:
+        if r.status != 200:
+            return detail
+        games_data = await r.json()
+        games = games_data.get("results", [])
+
+    # Top 10 par note Metacritic
+    with_score = [g for g in games if g.get("metacritic")]
+    top_rated = sorted(with_score, key=lambda g: g["metacritic"], reverse=True)[:10]
+
+    # 10 plus récents
+    with_date = [g for g in games if g.get("released")]
+    most_recent = sorted(with_date, key=lambda g: g["released"], reverse=True)[:10]
+
+    detail["_top_rated"] = top_rated
+    detail["_most_recent"] = most_recent
+    return detail
+
+
+def build_studio_embed(data: dict) -> discord.Embed:
+    import re
+    name = data.get("name", "Inconnu")
+    image = data.get("image") or data.get("image_background") or ""
+    games_count = data.get("games_count", 0)
+    description = data.get("description") or ""
+    slug = data.get("slug", "")
+    rawg_url = f"https://rawg.io/developers/{slug}"
+
+    embed = discord.Embed(
+        title=f"🏢 {name}",
+        color=discord.Color.dark_blue(),
+        url=rawg_url,
+    )
+
+    if image:
+        embed.set_thumbnail(url=image)
+
+    # Année de fondation extraite de la description (RAWG ne l'expose pas en champ dédié)
+    founded_year = None
+    if description:
+        match = re.search(r"founded\D{0,10}(\d{4})|(\d{4})\D{0,10}founded|established\D{0,10}(\d{4})", description, re.IGNORECASE)
+        if match:
+            founded_year = next(y for y in match.groups() if y)
+
+    if founded_year:
+        embed.add_field(name="Fondé en", value=founded_year, inline=True)
+    embed.add_field(name="Jeux au total", value=str(games_count), inline=True)
+
+    # Top 10 jeux les mieux notés
+    top_rated = data.get("_top_rated", [])
+    if top_rated:
+        lines = "\n".join(
+            f"`{g['metacritic']:>3}/100` • **{g['name']}** ({(g.get('released') or '')[:4]})"
+            for g in top_rated
+        )
+        embed.add_field(name="🏆 Top 10 mieux notés (Metacritic)", value=lines, inline=False)
+
+    # 10 jeux les plus récents
+    most_recent = data.get("_most_recent", [])
+    if most_recent:
+        lines = "\n".join(
+            f"• **{g['name']}** ({(g.get('released') or '')[:4]})"
+            + (f" — `{g['metacritic']}/100`" if g.get("metacritic") else "")
+            for g in most_recent
+        )
+        embed.add_field(name="🕐 10 jeux les plus récents", value=lines, inline=False)
+
+    # Description courte
+    if description:
+        clean = re.sub(r"<[^>]+>", "", description)
+        short = clean[:300] + "…" if len(clean) > 300 else clean
+        embed.add_field(name="À propos", value=short, inline=False)
+
+    embed.set_footer(text="Source : RAWG.io")
+    return embed
+
+
+@client.tree.command(name="studio", description="Affiche la fiche d'un studio de jeux vidéo")
+@app_commands.describe(nom="Nom du studio (ex: Nintendo, Ubisoft, Naughty Dog)")
+async def studio(interaction: discord.Interaction, nom: str):
+    await interaction.response.defer()
+
+    async with aiohttp.ClientSession() as session:
+        data = await fetch_studio(session, nom)
+        if not data:
+            await interaction.followup.send(f"❌ Aucun studio trouvé pour **{nom}**.")
+            return
+        embed = build_studio_embed(data)
+
+    await interaction.followup.send(embed=embed)
+
+
 @client.event
 async def on_ready():
     print(f"✅ Connecté en tant que {client.user} (ID: {client.user.id})")
